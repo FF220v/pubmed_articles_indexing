@@ -1,0 +1,10 @@
+*.idea
+*target
+*.save
+*.key
+*~$
+*deploy_tmp
+*out
+*.iml
+*.swp
+*mounted_volumes
