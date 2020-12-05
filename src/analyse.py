@@ -58,7 +58,7 @@ def analyse_keywords(keywords):
     keys_to_query = [k[0] for k in docs_most_relevant]
     results = [json.loads(res) for res in SESSIONS[DOCS_DATABASE].mget(keys_to_query)]
     for result, doc in zip(results, docs_most_relevant):
-        result['score'] = doc[1]
+        result['score'] = round(doc[1], 5)
     print(json.dumps(results, indent=2))
 
 
