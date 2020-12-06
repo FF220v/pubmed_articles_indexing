@@ -56,10 +56,15 @@ def analyse_keywords(keywords):
 
     docs_most_relevant = sorted(list((k, v) for k, v in docs_scores.items()), key=lambda x: x[1], reverse=True)[:30]
     keys_to_query = [k[0] for k in docs_most_relevant]
-    results = [json.loads(res) for res in SESSIONS[DOCS_DATABASE].mget(keys_to_query)]
+    results = [json.loads(res) if res is not None else {} for res in SESSIONS[DOCS_DATABASE].mget(keys_to_query)]
     for result, doc in zip(results, docs_most_relevant):
         result['score'] = round(doc[1], 5)
-    print(json.dumps(results, indent=2))
+    file_data = json.dumps(results, indent=2)
+
+    with open("report.json", mode="w+") as f:
+        f.write(file_data)
+    print(file_data)
+    print("Saved report to file!")
 
 
 def worker(keywords):
@@ -67,4 +72,4 @@ def worker(keywords):
 
 
 if __name__ == "__main__":
-    worker("diagnostic ultrasound")
+    worker("lactose intolerance")

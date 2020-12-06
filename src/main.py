@@ -1,6 +1,4 @@
 import argparse
-from build import worker as build
-from analyse import worker as analyse
 
 
 def parse_args():
@@ -14,9 +12,11 @@ if __name__ == "__main__":
     args = parse_args()
     if args.find and args.build:
         print("Only one command can be passed")
-        exit(0)
-    if args.find:
+    elif args.find:
+        from analyse import worker as analyse
         keywords = " ".join(args.find)
         analyse(keywords)
-    if args.build:
+    elif args.build:
+        from build import worker as build
         build()
+    exit(0)

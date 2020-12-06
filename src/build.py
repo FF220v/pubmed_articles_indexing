@@ -2,16 +2,26 @@ import asyncio
 import gzip
 import json
 from dataclasses import dataclass, field
-from io import BytesIO
-from aiohttp import ClientSession
+from io import BytesIO, StringIO
 from multiprocessing import Pool
+
+from aiohttp import ClientSession
 from bs4 import BeautifulSoup
 from lxml import etree
+
+from http_session import get_client_session
 from redis_stuff import DOCS_DATABASE, KEYWORDS_INDEX, ABSTRACTS_INDEX, TITLES_INDEX, \
     CHEMICALS_INDEX, AUTHOR_INDEX, DATABASES_TO_PROCESS, SESSIONS
 from vector import preprocess_text, make_words_vector
 
 PUBMED_MAIN_URL = "https://ftp.ncbi.nlm.nih.gov/pubmed/baseline/"
+
+MAX_LINKS = 10
+
+REFERENCES_LINK_TYPE = "pubmed_pubmed_refs"
+SIMILAR_LINK_TYPE = "pubmed_pubmed"
+CITEDIN_LINK_TYPE = "pubmed_pubmed_citedin"
+
 
 MAJOR_TOPIC_MULTIPLIER = 2
 
@@ -71,18 +81,73 @@ def get_index_builder(index: int, field: str):
     return builder_base
 
 
+def async_wait_and_retry(coro):
+    async def wrapper(*args, **kwargs):
+        trial = 1
+        while True:
+            try:
+                return await coro(*args, **kwargs)
+            except Exception as e:
+                if trial < 10:
+                    if isinstance(e, Non200Exception):
+                        wait_seconds = trial * 0.25
+                    else:
+                        wait_seconds = 0
+                    print(f"Exception: {e}, Trial {trial}. Waiting {wait_seconds} s.")
+                    await asyncio.sleep(wait_seconds)
+                    trial += 1
+                else:
+                    raise e
+    return wrapper
+
+
+class Non200Exception(Exception):
+    pass
+
+
+@async_wait_and_retry
+async def get_links(url):
+    session = get_client_session()
+    resp = await session.get(url)
+    if resp.status != 200:
+        raise Non200Exception(f"Got status {resp.status}")
+    return resp
+
+
+async def get_links_by_article(article_id, link_type, return_type_name):
+    url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?dbfrom=pubmed&linkname={link_type}&id={article_id}"
+    resp = await get_links(url)
+    resp_text = await resp.text()
+    parser = etree.XMLParser(ns_clean=True)
+    tree = etree.parse(BytesIO(bytes(resp_text, 'utf-8')), parser).getroot()
+    links = [make_pubmed_link(l.text) for l in find_data_recursive(tree, ["LinkSet", "LinkSetDb", "Link", "Id"])]
+    return return_type_name, links[:MAX_LINKS]
+
+
+def make_pubmed_link(article_id):
+    return f"https://pubmed.ncbi.nlm.nih.gov/{article_id}/"
+
+
 def docs_database_builder(article_data: ArticleData):
     session = SESSIONS[DOCS_DATABASE]
     article_id = [article_id for article_id in article_data.article_ids
                   if article_id.attrs.get("IdType") == "pubmed"][0].text
-    session.set(article_id, json.dumps(
-        {
-            "title": article_data.titles[0].text if article_data.titles else None,
-            "language": article_data.language[0].text if article_data.language else None,
-            "article_url": f"https://pubmed.ncbi.nlm.nih.gov/{article_id}/",
-            "article_ids": {a_id.attrs.get("IdType"): a_id.text for a_id in article_data.article_ids}
-        }
-    ))
+
+    results = asyncio.get_event_loop().run_until_complete(
+        asyncio.gather(get_links_by_article(article_id, CITEDIN_LINK_TYPE, "cited_in"),
+                       get_links_by_article(article_id, REFERENCES_LINK_TYPE, "references"),
+                       get_links_by_article(article_id, SIMILAR_LINK_TYPE, "similar_articles")))
+    results = dict(results)
+
+    res_dict = {
+        "title": article_data.titles[0].text if article_data.titles else None,
+        "language": article_data.language[0].text if article_data.language else None,
+        "article_url": make_pubmed_link(article_id),
+        "article_ids": {a_id.attrs.get("IdType"): a_id.text for a_id in article_data.article_ids},
+    }
+    res_dict.update(results)
+
+    session.set(article_id, json.dumps(res_dict))
 
 
 BUILDERS = {
@@ -116,12 +181,12 @@ def find_data_recursive(root, path: list):
             results.extend(find_data_recursive(root, path[1:]))
         return results
     else:
-        return [ArticleDataItem(text=root.text, attrs=dict(root.attrib))]
+        return [ArticleDataItem(text=root.text, attrs=dict(root.attrib))] if root.text is not None else []
 
 
 async def data_reader(max_files=0, files_offset=0):
     articles_counter = 0
-    session = ClientSession()
+    session = get_client_session()
     urls = await get_files_url(session)
     urls = urls[files_offset:] if not max_files else urls[files_offset: files_offset + max_files]
 
@@ -129,6 +194,7 @@ async def data_reader(max_files=0, files_offset=0):
         print(f"getting file {url}")
         resp = await session.get(url)
         compressed_file = BytesIO(await resp.content.read())
+        print(f"got file {url}")
         decompressed_file = gzip.GzipFile(fileobj=compressed_file)
         parser = etree.XMLParser(ns_clean=True)
         tree = etree.parse(decompressed_file, parser).getroot()
@@ -146,8 +212,8 @@ async def data_reader(max_files=0, files_offset=0):
                         find_data_recursive(article, ["MedlineCitation", "Article", "AuthorList", "Author", "ForeName"])
             )
             articles_counter += 1
-            if articles_counter % 10000 == 0:
-                print(f"Processed {articles_counter} articles")
+            if articles_counter % 10 == 0:
+                print(f"Yielded {articles_counter} articles")
             yield article_data
 
 
@@ -169,13 +235,14 @@ async def build_indices(max_files=0, files_offset=0):
             args.append((index, item))
         index_builders_pool.map(index_processor, args)
         articles_counter += 1
-        if articles_counter % 100 == 0:
+        if articles_counter % 10 == 0:
             print(f"Processed {articles_counter} articles")
     print("Building finished!")
+    index_builders_pool.close()
 
 
 def worker():
-    asyncio.get_event_loop().run_until_complete(build_indices(max_files=0, files_offset=103))
+    asyncio.get_event_loop().run_until_complete(build_indices(max_files=0, files_offset=150))
 
 
 if __name__ == "__main__":
